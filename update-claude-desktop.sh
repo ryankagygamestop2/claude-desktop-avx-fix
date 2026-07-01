@@ -39,9 +39,11 @@ APP_BINARY_PATH="$CLAUDE_CODE_DIR/$LATEST_VERSION/claude.app/Contents/MacOS/clau
 STANDALONE_BINARY_PATH="$CLAUDE_CODE_DIR/$LATEST_VERSION/claude"
 echo "Found desktop claude-code version: $LATEST_VERSION"
 
-# Update npm package to latest
-echo "Updating @anthropic-ai/claude-code via npm..."
-npm install -g @anthropic-ai/claude-code@latest
+# Pin to 2.1.112 — later versions dropped the bundled cli.js in favor of a
+# platform-specific native binary (same AVX2 requirement this script exists
+# to work around), so "@latest" silently breaks this fix.
+echo "Installing @anthropic-ai/claude-code@2.1.112..."
+npm install -g @anthropic-ai/claude-code@2.1.112
 
 # Find the installed cli.js
 CLI_JS="$(npm root -g)/@anthropic-ai/claude-code/cli.js"
