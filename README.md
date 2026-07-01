@@ -45,36 +45,53 @@ Re-run the script after the desktop app updates:
 4. Replaces it with a shell wrapper that invokes the Node.js version
 5. Restart the Claude desktop app to apply
 
-## Auth Token Refresh Issue (v2.1.112+)
+## Auth Token Issues (v2.1.112)
 
-**Problem:** If you see `API Error: 401 "Invalid authentication credentials"` after running `/login`, this is a token refresh issue. The `/login` command succeeds and stores credentials, but subsequent API calls are rejected with 401.
+**Problem:** `API Error: 401 "Invalid authentication credentials"` after `/login` succeeds.
 
-**Root Cause:** v2.1.112 doesn't automatically refresh tokens when they expire or are rejected by the API.
+**Root Cause:** v2.1.112 is **incompatible with the current Anthropic API**. The API changed to require an `anthropic-version` header and has different token validation logic that v2.1.112 doesn't implement.
 
-**Solution:** Use the provided `claude-wrapper.sh` script instead of running `claude` directly. The wrapper patches `cli.js` to:
-1. Intercept 401 auth errors
-2. Automatically refresh the token using the stored `refreshToken`
-3. Retry the failed request with the new token
+### Investigation & Findings
 
-### Setup auth fix
+Through extensive debugging, we discovered:
 
-Replace your current shim with the patched wrapper:
+1. **v2.1.112 doesn't send the Authorization header** for the messages API endpoint
+   - The `/api/eval` endpoint receives it and works (returns 200)
+   - The `/v1/messages` endpoint doesn't receive it (returns 401)
 
-```bash
-# Copy the wrapper into your nvm Node directory
-cp claude-wrapper.sh ~/.nvm/versions/node/v24.14.0/bin/claude
-chmod +x ~/.nvm/versions/node/v24.14.0/bin/claude
+2. **Current API requires `anthropic-version` header** 
+   - Without it: `"anthropic-version: header is required"`
+   - With it: `"Invalid bearer token"` (different error)
 
-# Or create a symlink to it
-ln -sf /path/to/claude-wrapper.sh ~/.nvm/versions/node/v24.14.0/bin/claude
-```
+3. **Token format incompatibility**
+   - Even when all headers are correctly injected, the token is rejected
+   - The token works for `/login` but not for messages API
+   - This suggests Anthropic changed their token validation
 
-The wrapper will automatically patch `cli.js` the first time it runs. You may see `[claude-auth]` messages during token refresh, which is expected.
+### Workarounds Attempted
 
-If you still get 401 errors after the patch:
-1. Try logging out and back in: `/logout` then `/login`
-2. Clear credentials: `rm ~/.claude/.credentials.json`
-3. Check your Anthropic account status at https://console.anthropic.com
+We created a runtime wrapper (`claude-wrapper-final.js`) that:
+- Injects the missing Authorization header
+- Adds the required anthropic-version header
+- Re-reads credentials on each request
+
+**Status:** Partially working. Headers are injected correctly, but API still returns 401.
+
+### Recommended Solutions
+
+Since v2.1.112 is incompatible with current API:
+
+1. **Option A: Use a newer Claude Code version**
+   - Check if newer versions can run on your Mac without AVX2
+   - Newer versions have proper API support
+
+2. **Option B: Contact Anthropic support**
+   - Report that v2.1.112 stopped working
+   - Ask about older version API compatibility
+
+3. **Option C: Investigate AVX2 workarounds**
+   - Check if there's a way to use newer versions on pre-AVX2 hardware
+   - Explore CPU emulation or QEMU options
 
 ## Affected hardware
 
