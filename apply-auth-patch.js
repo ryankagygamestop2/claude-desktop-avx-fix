@@ -23,10 +23,10 @@ const PATCH_CODE = `
 // Fixes: API Error 401 "Invalid authentication credentials" on token expiry
 // ============================================================================
 
-const __claudeAuthPatch = (() => {
-  const fs = require('fs');
-  const path = require('path');
-  const os = require('os');
+const __claudeAuthPatch = (async () => {
+  const fs = await import('fs').then(m => m.default || m);
+  const path = await import('path').then(m => m.default || m);
+  const os = await import('os').then(m => m.default || m);
 
   const CREDS_FILE = path.join(os.homedir(), '.claude', '.credentials.json');
   let tokenRefreshInProgress = null;
@@ -54,7 +54,6 @@ const __claudeAuthPatch = (() => {
   }
 
   async function refreshToken() {
-    // Prevent concurrent refresh attempts
     if (tokenRefreshInProgress) return tokenRefreshInProgress;
 
     tokenRefreshInProgress = (async () => {
@@ -67,11 +66,7 @@ const __claudeAuthPatch = (() => {
 
         console.error('[claude-auth] Attempting token refresh...');
 
-        // Use the original fetch before our wrapper
-        const fetchImpl = typeof globalThis !== 'undefined'
-          ? globalThis.__originalFetch
-          : global.__originalFetch;
-
+        const fetchImpl = globalThis.__originalFetch || global.__originalFetch;
         if (!fetchImpl) {
           console.error('[claude-auth] Original fetch not available');
           return null;
@@ -99,7 +94,6 @@ const __claudeAuthPatch = (() => {
           return null;
         }
 
-        // Update credentials
         creds.claudeAiOauth.accessToken = newAccessToken;
         if (data.expiresIn) {
           creds.claudeAiOauth.expiresAt = Date.now() + (data.expiresIn * 1000);
@@ -121,76 +115,39 @@ const __claudeAuthPatch = (() => {
     return tokenRefreshInProgress;
   }
 
-  // Wrap the global fetch to handle 401 errors
-  const originalFetch = typeof globalThis !== 'undefined'
-    ? globalThis.fetch
-    : global.fetch;
+  const originalFetch = globalThis.fetch || global.fetch;
 
   if (originalFetch) {
-    if (typeof globalThis !== 'undefined') {
-      globalThis.__originalFetch = originalFetch;
-      globalThis.fetch = async function claudeAuthFetch(url, options) {
-        let response = await originalFetch(url, options);
+    globalThis.__originalFetch = originalFetch;
+    globalThis.fetch = async function claudeAuthFetch(url, options) {
+      let response = await originalFetch(url, options);
 
-        // If 401, try token refresh and retry once
-        if (response.status === 401) {
-          console.error('[claude-auth] Received 401, attempting token refresh...');
-          const newToken = await refreshToken();
+      if (response.status === 401) {
+        console.error('[claude-auth] Received 401, attempting token refresh...');
+        const newToken = await refreshToken();
 
-          if (newToken && options?.headers) {
-            // Retry with new token
-            const retryOptions = JSON.parse(JSON.stringify(options));
-            retryOptions.headers = { ...retryOptions.headers };
-            retryOptions.headers['Authorization'] = \`Bearer \${newToken}\`;
+        if (newToken && options?.headers) {
+          const retryOptions = JSON.parse(JSON.stringify(options));
+          retryOptions.headers = { ...retryOptions.headers };
+          retryOptions.headers['Authorization'] = \`Bearer \${newToken}\`;
 
-            console.error('[claude-auth] Retrying with refreshed token...');
-            response = await originalFetch(url, retryOptions);
+          console.error('[claude-auth] Retrying with refreshed token...');
+          response = await originalFetch(url, retryOptions);
 
-            if (response.ok) {
-              console.error('[claude-auth] ✓ Retry successful');
-            }
+          if (response.ok) {
+            console.error('[claude-auth] ✓ Retry successful');
           }
         }
+      }
 
-        return response;
-      };
-    } else {
-      global.__originalFetch = originalFetch;
-      global.fetch = async function claudeAuthFetch(url, options) {
-        let response = await originalFetch(url, options);
-
-        if (response.status === 401) {
-          console.error('[claude-auth] Received 401, attempting token refresh...');
-          const newToken = await refreshToken();
-
-          if (newToken && options?.headers) {
-            const retryOptions = JSON.parse(JSON.stringify(options));
-            retryOptions.headers = { ...retryOptions.headers };
-            retryOptions.headers['Authorization'] = \`Bearer \${newToken}\`;
-
-            console.error('[claude-auth] Retrying with refreshed token...');
-            response = await originalFetch(url, retryOptions);
-
-            if (response.ok) {
-              console.error('[claude-auth] ✓ Retry successful');
-            }
-          }
-        }
-
-        return response;
-      };
-    }
+      return response;
+    };
   }
 
   return { refreshToken, readCredentials };
 })();
 
-// Make it available globally
-if (typeof globalThis !== 'undefined') {
-  globalThis.__claudeAuthPatch = __claudeAuthPatch;
-} else {
-  global.__claudeAuthPatch = __claudeAuthPatch;
-}
+globalThis.__claudeAuthPatch = __claudeAuthPatch;
 
 `;
 
