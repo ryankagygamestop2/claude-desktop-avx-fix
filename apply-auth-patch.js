@@ -23,131 +23,106 @@ const PATCH_CODE = `
 // Fixes: API Error 401 "Invalid authentication credentials" on token expiry
 // ============================================================================
 
-const __claudeAuthPatch = (async () => {
-  const fs = await import('fs').then(m => m.default || m);
-  const path = await import('path').then(m => m.default || m);
-  const os = await import('os').then(m => m.default || m);
+(async () => {
+  try {
+    // Dynamic imports for ES module compatibility
+    const fs = (await import('fs/promises')).default || (await import('fs'));
+    const fsSync = require('fs');
+    const path = (await import('path')).default || (await import('path'));
+    const os = (await import('os')).default || (await import('os'));
 
-  const CREDS_FILE = path.join(os.homedir(), '.claude', '.credentials.json');
-  let tokenRefreshInProgress = null;
+    const CREDS_FILE = path.join(os.homedir(), '.claude', '.credentials.json');
+    let tokenRefreshInProgress = null;
 
-  async function readCredentials() {
-    try {
-      if (!fs.existsSync(CREDS_FILE)) return null;
-      const data = fs.readFileSync(CREDS_FILE, 'utf-8');
-      return JSON.parse(data);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  async function writeCredentials(creds) {
-    try {
-      const dir = path.dirname(CREDS_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2));
-      return true;
-    } catch (e) {
-      console.error('[claude-auth] Failed to write credentials:', e.message);
-      return false;
-    }
-  }
-
-  async function refreshToken() {
-    if (tokenRefreshInProgress) return tokenRefreshInProgress;
-
-    tokenRefreshInProgress = (async () => {
+    async function readCredentials() {
       try {
-        const creds = await readCredentials();
-        if (!creds?.claudeAiOauth?.refreshToken) {
-          console.error('[claude-auth] No refresh token available');
-          return null;
-        }
-
-        console.error('[claude-auth] Attempting token refresh...');
-
-        const fetchImpl = globalThis.__originalFetch || global.__originalFetch;
-        if (!fetchImpl) {
-          console.error('[claude-auth] Original fetch not available');
-          return null;
-        }
-
-        const response = await fetchImpl('https://api.anthropic.com/v1/auth/refresh', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': \`Bearer \${creds.claudeAiOauth.refreshToken}\`,
-          },
-          body: JSON.stringify({ refreshToken: creds.claudeAiOauth.refreshToken }),
-        });
-
-        if (!response.ok) {
-          console.error('[claude-auth] Token refresh failed:', response.status, response.statusText);
-          return null;
-        }
-
-        const data = await response.json();
-        const newAccessToken = data.accessToken || data.access_token;
-
-        if (!newAccessToken) {
-          console.error('[claude-auth] No access token in refresh response');
-          return null;
-        }
-
-        creds.claudeAiOauth.accessToken = newAccessToken;
-        if (data.expiresIn) {
-          creds.claudeAiOauth.expiresAt = Date.now() + (data.expiresIn * 1000);
-        } else if (data.expires_in) {
-          creds.claudeAiOauth.expiresAt = Date.now() + (data.expires_in * 1000);
-        }
-
-        const written = await writeCredentials(creds);
-        if (written) {
-          console.error('[claude-auth] ✓ Token refreshed successfully');
-          return newAccessToken;
-        }
-      } catch (error) {
-        console.error('[claude-auth] Error during refresh:', error.message);
+        const data = await fs.readFile(CREDS_FILE, 'utf-8');
+        return JSON.parse(data);
+      } catch (e) {
+        return null;
       }
-      return null;
-    })();
+    }
 
-    return tokenRefreshInProgress;
-  }
+    async function writeCredentials(creds) {
+      try {
+        await fs.writeFile(CREDS_FILE, JSON.stringify(creds, null, 2));
+        return true;
+      } catch (e) {
+        console.error('[claude-auth] Failed to write credentials:', e.message);
+        return false;
+      }
+    }
 
-  const originalFetch = globalThis.fetch || global.fetch;
+    async function refreshToken() {
+      if (tokenRefreshInProgress) return await tokenRefreshInProgress;
 
-  if (originalFetch) {
-    globalThis.__originalFetch = originalFetch;
-    globalThis.fetch = async function claudeAuthFetch(url, options) {
-      let response = await originalFetch(url, options);
-
-      if (response.status === 401) {
-        console.error('[claude-auth] Received 401, attempting token refresh...');
-        const newToken = await refreshToken();
-
-        if (newToken && options?.headers) {
-          const retryOptions = JSON.parse(JSON.stringify(options));
-          retryOptions.headers = { ...retryOptions.headers };
-          retryOptions.headers['Authorization'] = \`Bearer \${newToken}\`;
-
-          console.error('[claude-auth] Retrying with refreshed token...');
-          response = await originalFetch(url, retryOptions);
-
-          if (response.ok) {
-            console.error('[claude-auth] ✓ Retry successful');
+      tokenRefreshInProgress = (async () => {
+        try {
+          const creds = await readCredentials();
+          if (!creds?.claudeAiOauth?.refreshToken) {
+            return null;
           }
+
+          console.error('[claude-auth] Refreshing token...');
+
+          const origFetch = globalThis.__origFetch;
+          if (!origFetch) return null;
+
+          const response = await origFetch('https://api.anthropic.com/v1/auth/refresh', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': \`Bearer \${creds.claudeAiOauth.refreshToken}\`,
+            },
+            body: JSON.stringify({ refreshToken: creds.claudeAiOauth.refreshToken }),
+          });
+
+          if (!response.ok) return null;
+
+          const data = await response.json();
+          const newToken = data.accessToken || data.access_token;
+
+          if (!newToken) return null;
+
+          creds.claudeAiOauth.accessToken = newToken;
+          if (data.expiresIn) {
+            creds.claudeAiOauth.expiresAt = Date.now() + data.expiresIn * 1000;
+          }
+
+          await writeCredentials(creds);
+          console.error('[claude-auth] ✓ Token refreshed');
+          return newToken;
+        } catch (e) {
+          console.error('[claude-auth] Refresh error:', e.message);
+          return null;
+        }
+      })();
+
+      return await tokenRefreshInProgress;
+    }
+
+    // Wrap fetch
+    const origFetch = globalThis.fetch;
+    globalThis.__origFetch = origFetch;
+    globalThis.fetch = async (url, opts) => {
+      let res = await origFetch(url, opts);
+
+      if (res.status === 401) {
+        const newToken = await refreshToken();
+        if (newToken && opts?.headers) {
+          opts.headers.Authorization = \`Bearer \${newToken}\`;
+          res = await origFetch(url, opts);
         }
       }
 
-      return response;
+      return res;
     };
+
+    console.error('[claude-auth] Patch loaded');
+  } catch (e) {
+    console.error('[claude-auth] Patch error:', e.message);
   }
-
-  return { refreshToken, readCredentials };
 })();
-
-globalThis.__claudeAuthPatch = __claudeAuthPatch;
 
 `;
 
