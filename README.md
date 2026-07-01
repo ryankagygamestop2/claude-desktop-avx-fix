@@ -45,6 +45,37 @@ Re-run the script after the desktop app updates:
 4. Replaces it with a shell wrapper that invokes the Node.js version
 5. Restart the Claude desktop app to apply
 
+## Auth Token Refresh Issue (v2.1.112+)
+
+**Problem:** If you see `API Error: 401 "Invalid authentication credentials"` after running `/login`, this is a token refresh issue. The `/login` command succeeds and stores credentials, but subsequent API calls are rejected with 401.
+
+**Root Cause:** v2.1.112 doesn't automatically refresh tokens when they expire or are rejected by the API.
+
+**Solution:** Use the provided `claude-wrapper.sh` script instead of running `claude` directly. The wrapper patches `cli.js` to:
+1. Intercept 401 auth errors
+2. Automatically refresh the token using the stored `refreshToken`
+3. Retry the failed request with the new token
+
+### Setup auth fix
+
+Replace your current shim with the patched wrapper:
+
+```bash
+# Copy the wrapper into your nvm Node directory
+cp claude-wrapper.sh ~/.nvm/versions/node/v24.14.0/bin/claude
+chmod +x ~/.nvm/versions/node/v24.14.0/bin/claude
+
+# Or create a symlink to it
+ln -sf /path/to/claude-wrapper.sh ~/.nvm/versions/node/v24.14.0/bin/claude
+```
+
+The wrapper will automatically patch `cli.js` the first time it runs. You may see `[claude-auth]` messages during token refresh, which is expected.
+
+If you still get 401 errors after the patch:
+1. Try logging out and back in: `/logout` then `/login`
+2. Clear credentials: `rm ~/.claude/.credentials.json`
+3. Check your Anthropic account status at https://console.anthropic.com
+
 ## Affected hardware
 
 Any Intel Mac with a CPU older than Haswell (4th gen, 2013), including:
