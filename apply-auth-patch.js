@@ -6,9 +6,9 @@
  * The fix: Inject a fetch wrapper that intercepts 401 errors and refreshes the token.
  */
 
-import fs from "fs";
-import path from "path";
-import os from "os";
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 const cliPath = process.argv[2];
 

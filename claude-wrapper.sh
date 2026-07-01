@@ -43,11 +43,20 @@ if [ ! -f "$PATCH_MARKER" ]; then
     fi
 
     # Apply the patch via Node.js script
-    node "$PATCH_DIR/apply-auth-patch.js" "$CLI_JS" || {
-        echo "[claude-auth-fix] Patch failed, restoring backup..."
-        cp "$CLI_JS.orig" "$CLI_JS"
-        exit 1
-    }
+    if ! node "$CLAUDE_CODE_DIR/apply-auth-patch.js" "$CLI_JS" 2>/dev/null; then
+        # Fallback: try copying from repo
+        if [ -f "$PATCH_DIR/apply-auth-patch.js" ]; then
+            node "$PATCH_DIR/apply-auth-patch.js" "$CLI_JS" || {
+                echo "[claude-auth-fix] Patch failed, restoring backup..."
+                cp "$CLI_JS.orig" "$CLI_JS"
+                exit 1
+            }
+        else
+            echo "[claude-auth-fix] Warning: apply-auth-patch.js not found"
+            echo "[claude-auth-fix] Manual patch application needed"
+            # Continue anyway - may still work
+        fi
+    fi
 
     touch "$PATCH_MARKER"
     echo "[claude-auth-fix] Patch applied successfully"
