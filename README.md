@@ -45,53 +45,94 @@ Re-run the script after the desktop app updates:
 4. Replaces it with a shell wrapper that invokes the Node.js version
 5. Restart the Claude desktop app to apply
 
-## Auth Token Issues (v2.1.112)
+## Auth Token Issues: "Please run /login" loop after login succeeds
 
-**Problem:** `API Error: 401 "Invalid authentication credentials"` after `/login` succeeds.
+**Symptom:** `/login` reports "Login successful", but every request immediately after fails with:
 
-**Root Cause:** v2.1.112 is **incompatible with the current Anthropic API**. The API changed to require an `anthropic-version` header and has different token validation logic that v2.1.112 doesn't implement.
+```
+API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}
+```
 
-### Investigation & Findings
+No amount of repeating `/login`, `/logout`, deleting `~/.claude/.credentials.json`, or reinstalling the npm package fixes it.
 
-Through extensive debugging, we discovered:
+**This is not a Claude Code bug or an API compatibility issue.** On macOS, Claude Code stores OAuth credentials in the login Keychain (service name `Claude Code-credentials`), not in a plaintext file. If the Keychain itself can't be written to, `/login` completes the OAuth handshake successfully but silently fails to persist the new token — so every subsequent request keeps using whatever stale token was already in Keychain, which is likely expired or revoked.
 
-1. **v2.1.112 doesn't send the Authorization header** for the messages API endpoint
-   - The `/api/eval` endpoint receives it and works (returns 200)
-   - The `/v1/messages` endpoint doesn't receive it (returns 401)
+### How to diagnose
 
-2. **Current API requires `anthropic-version` header** 
-   - Without it: `"anthropic-version: header is required"`
-   - With it: `"Invalid bearer token"` (different error)
+Confirm the Keychain is actually the problem with a test unrelated to Claude Code entirely:
 
-3. **Token format incompatibility**
-   - Even when all headers are correctly injected, the token is rejected
-   - The token works for `/login` but not for messages API
-   - This suggests Anthropic changed their token validation
+```bash
+security add-generic-password -a "$USER" -s "diagnostic-test" -w "hello123" -U
+security find-generic-password -a "$USER" -w -s "diagnostic-test"
+security delete-generic-password -a "$USER" -s "diagnostic-test"
+```
 
-### Workarounds Attempted
+If the middle command doesn't print back `hello123`, or you see an error like:
 
-We created a runtime wrapper (`claude-wrapper-final.js`) that:
-- Injects the missing Authorization header
-- Adds the required anthropic-version header
-- Re-reads credentials on each request
+```
+security: SecKeychainItemCreateFromContent (<default>): UNIX[Permission denied]
+```
 
-**Status:** Partially working. Headers are injected correctly, but API still returns 401.
+your login keychain itself is rejecting writes — independent of Claude Code.
 
-### Recommended Solutions
+Check the actual `Claude Code-credentials` entry's last-modified time to confirm it's stale despite recent "successful" logins:
 
-Since v2.1.112 is incompatible with current API:
+```bash
+security find-generic-password -a "$USER" -s "Claude Code-credentials" 2>&1 | grep -E "cdat|mdat"
+```
 
-1. **Option A: Use a newer Claude Code version**
-   - Check if newer versions can run on your Mac without AVX2
-   - Newer versions have proper API support
+If `mdat` (modified date) is much older than your most recent `/login`, that confirms writes aren't persisting.
 
-2. **Option B: Contact Anthropic support**
-   - Report that v2.1.112 stopped working
-   - Ask about older version API compatibility
+### Root cause (in our case)
 
-3. **Option C: Investigate AVX2 workarounds**
-   - Check if there's a way to use newer versions on pre-AVX2 hardware
-   - Explore CPU emulation or QEMU options
+Two things had gone wrong with `~/Library/Keychains/login.keychain-db`:
+
+1. **`com.apple.quarantine` extended attribute** was stamped on the keychain file itself (in our case, by Chrome at some point) — macOS blocks command-line tools like `security` from writing to quarantined files.
+2. **A stale/dead keychain reference in the search list** (an old renamed/archived keychain) caused extra unlock prompts even after the main issue was fixed.
+
+Check for both:
+
+```bash
+xattr -l ~/Library/Keychains/login.keychain-db
+ls -le ~/Library/Keychains/login.keychain-db   # look for unexpected ACL entries
+security list-keychains                          # look for dead/orphaned entries
+```
+
+### The fix
+
+```bash
+# 1. Strip the quarantine flag
+xattr -d com.apple.quarantine ~/Library/Keychains/login.keychain-db
+
+# 2. Clear any custom ACL entries
+chmod -N ~/Library/Keychains/login.keychain-db
+
+# 3. Clear any stale file flags
+chflags nouchg ~/Library/Keychains/login.keychain-db
+
+# 4. Re-bind and unlock the default keychain explicitly
+security default-keychain -s ~/Library/Keychains/login.keychain-db
+security unlock-keychain ~/Library/Keychains/login.keychain-db
+
+# 5. Verify the diagnostic test now works
+security add-generic-password -a "$USER" -s "diagnostic-test" -w "hello123" -U
+security find-generic-password -a "$USER" -w -s "diagnostic-test"
+security delete-generic-password -a "$USER" -s "diagnostic-test"
+```
+
+If you still get an unlock popup for an old/unfamiliar keychain name after this, it's a dead entry in the keychain search list — drop it and rebuild the list pointing only at your real keychain:
+
+```bash
+security delete-keychain <old-keychain-name>.keychain-db   # or the absolute path if the short name isn't found
+security list-keychains -s ~/Library/Keychains/login.keychain-db
+security list-keychains   # should show exactly one entry: login.keychain-db
+```
+
+Then `claude /login` again — it should now persist correctly, and normal usage should stop 401ing.
+
+### Note on the AVX2 shim + this issue
+
+This Keychain problem is unrelated to the AVX2 fix above and can happen on any Mac. It came up here because it coincided with adding a second bootable macOS volume on the same machine, which is what stamped/disturbed the keychain file. If you're troubleshooting a 401 loop on a Mac running the Node.js-shimmed version of Claude Code from this repo, check Keychain health first before assuming it's a version/API incompatibility.
 
 ## Affected hardware
 
