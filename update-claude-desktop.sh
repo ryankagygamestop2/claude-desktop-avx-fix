@@ -14,6 +14,20 @@
 
 set -e
 
+# ---------------------------------------------------------------------------
+# Mutex: a background watcher can fire more than once in quick succession
+# (once on load, again because this script's own writes under claude-code
+# trigger the watch a second time before the first run finishes). Without
+# this, two concurrent `npm install` runs can race on npm's temp staging
+# directory and fail with a confusing EPERM/unlink error.
+# ---------------------------------------------------------------------------
+LOCK_DIR="/tmp/claude-desktop-avx-fix.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Another instance is already running (lock: $LOCK_DIR) — exiting."
+    exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
 CLAUDE_CODE_DIR="$HOME/Library/Application Support/Claude/claude-code"
 NVM_DIR="$HOME/.nvm"
 
@@ -32,43 +46,56 @@ CLI_WRAPPER="$NVM_BIN_DIR/claude"
 echo "Using node: $NODE_PATH ($(node -v))"
 
 # ---------------------------------------------------------------------------
-# Install the pinned npm package. Later versions dropped the bundled cli.js
-# in favor of a platform-specific native binary (same AVX2 requirement this
-# script exists to work around), so "@latest" silently breaks this fix.
-#
-# Unlock the CLI wrapper first if it's locked (chflags uchg) — npm refuses to
-# overwrite a non-symlink file at a package's bin path, and needs to manage
-# this path during install.
+# Install the pinned npm package — but only if it isn't already correctly
+# installed. Later versions dropped the bundled cli.js in favor of a
+# platform-specific native binary (same AVX2 requirement this script exists
+# to work around), so "@latest" silently breaks this fix. Skipping the
+# reinstall when nothing needs to change also means most watcher-triggered
+# runs never touch npm at all, which is the safest way to avoid races.
 # ---------------------------------------------------------------------------
-chflags nouchg "$CLI_WRAPPER" 2>/dev/null || true
-rm -f "$CLI_WRAPPER"
-
-echo "Installing @anthropic-ai/claude-code@2.1.112..."
-npm install -g @anthropic-ai/claude-code@2.1.112
-
 CLI_JS="$(npm root -g)/@anthropic-ai/claude-code/cli.js"
-if [ ! -f "$CLI_JS" ]; then
-    echo "Error: cli.js not found at $CLI_JS"
-    exit 1
+INSTALLED_VERSION=""
+if [ -f "$CLI_JS" ]; then
+    INSTALLED_VERSION=$(node -e "console.log(require('$(npm root -g)/@anthropic-ai/claude-code/package.json').version)" 2>/dev/null || echo "")
 fi
 
-NPM_VERSION=$(node -e "console.log(require('$(npm root -g)/@anthropic-ai/claude-code/package.json').version)")
-echo "npm claude-code version: $NPM_VERSION"
+if [ "$INSTALLED_VERSION" != "2.1.112" ]; then
+    # Unlock the CLI wrapper first if it's locked (chflags uchg) — npm
+    # refuses to overwrite a non-symlink file at a package's bin path, and
+    # needs to manage this path during install.
+    chflags nouchg "$CLI_WRAPPER" 2>/dev/null || true
+    rm -f "$CLI_WRAPPER"
+
+    echo "Installing @anthropic-ai/claude-code@2.1.112..."
+    npm install -g @anthropic-ai/claude-code@2.1.112
+
+    if [ ! -f "$CLI_JS" ]; then
+        echo "Error: cli.js not found at $CLI_JS"
+        exit 1
+    fi
+    NPM_VERSION=$(node -e "console.log(require('$(npm root -g)/@anthropic-ai/claude-code/package.json').version)")
+    echo "npm claude-code version: $NPM_VERSION"
+else
+    echo "npm claude-code already at 2.1.112 — skipping reinstall."
+fi
 
 # ---------------------------------------------------------------------------
-# Recreate and lock the CLI wrapper. npm's install just replaced it with its
-# own symlink to cli.js — overwrite that with our wrapper and lock it so
-# nothing (npm, the desktop app's auto-updater, etc.) can silently revert it.
+# Recreate and lock the CLI wrapper if it isn't already our wrapper script
+# (npm's install replaces it with its own symlink to cli.js when it runs).
 # ---------------------------------------------------------------------------
-cat > "$CLI_WRAPPER" << EOF
+if ! head -1 "$CLI_WRAPPER" 2>/dev/null | grep -q "^#!/bin/bash"; then
+    chflags nouchg "$CLI_WRAPPER" 2>/dev/null || true
+    rm -f "$CLI_WRAPPER"
+    cat > "$CLI_WRAPPER" << EOF
 #!/bin/bash
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
 exec node "$CLI_JS" "\$@"
 EOF
-chmod +x "$CLI_WRAPPER"
-chflags uchg "$CLI_WRAPPER"
-echo "Patched + locked CLI: $CLI_WRAPPER"
+    chmod +x "$CLI_WRAPPER"
+    chflags uchg "$CLI_WRAPPER"
+    echo "Patched + locked CLI: $CLI_WRAPPER"
+fi
 
 # ---------------------------------------------------------------------------
 # Patch every version directory found under the desktop app's claude-code
