@@ -39,11 +39,72 @@ Re-run the script after the desktop app updates:
 
 ## What it does
 
-1. Updates `@anthropic-ai/claude-code` npm package to the latest version
-2. Finds the latest version directory the desktop app created
-3. Backs up the native Bun binary (if present)
-4. Replaces it with a shell wrapper that invokes the Node.js version
-5. Restart the Claude desktop app to apply
+1. Installs the pinned `@anthropic-ai/claude-code@2.1.112` npm package
+2. Patches and locks the `claude` CLI wrapper in your nvm bin directory
+3. Finds **every** version directory the desktop app has created (it makes a new one on each update rather than overwriting the old one — see below) and, for each:
+   - Backs up the native Bun binary (if present)
+   - Replaces it with a shell wrapper that invokes the Node.js version
+   - Locks it with `chflags uchg` so it can't be silently reverted
+4. Restart the Claude desktop app to apply
+
+Safe to re-run anytime — it skips anything already patched, so it's cheap to call repeatedly (including from the background watcher below).
+
+## Handling desktop app auto-updates automatically
+
+The desktop app doesn't overwrite its binary in place when it updates — it creates a **new**, separately versioned directory (e.g. `2.1.202` next to the existing `2.1.197`) containing a fresh, unpatched native binary, and apparently re-verifies/restores its bundled binary at launch too. That means a one-time patch doesn't stay fixed forever; you either need to re-run `update-claude-desktop.sh` after every update, or set up a background watcher that does it for you automatically.
+
+To have it patch new versions the moment they appear, install a `launchd` agent that watches the app's `claude-code` directory and re-runs the script on any change:
+
+```bash
+REPO_DIR="$HOME/claude-desktop-avx-fix"
+PLIST_PATH="$HOME/Library/LaunchAgents/com.claude-desktop-avx-fix.watcher.plist"
+
+cat > "$PLIST_PATH" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-desktop-avx-fix.watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$REPO_DIR/update-claude-desktop.sh</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>$HOME/Library/Application Support/Claude/claude-code</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-desktop-avx-fix-watcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-desktop-avx-fix-watcher.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl bootstrap gui/$(id -u) "$PLIST_PATH"
+```
+
+This fires whenever anything changes under `claude-code` (a new version directory appearing counts) and also once at login, in case a version showed up while you were logged out. Since the script is idempotent and makes zero filesystem changes when everything's already patched, it settles after one real patch cycle rather than looping.
+
+Check it's running and see its log:
+
+```bash
+launchctl list | grep claude-desktop-avx-fix
+cat /tmp/claude-desktop-avx-fix-watcher.log
+```
+
+To disable it later:
+
+```bash
+launchctl bootout gui/$(id -u)/com.claude-desktop-avx-fix.watcher
+rm ~/Library/LaunchAgents/com.claude-desktop-avx-fix.watcher.plist
+```
 
 ## Auth Token Issues: "Please run /login" loop after login succeeds
 
