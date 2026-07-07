@@ -1,9 +1,16 @@
 #!/bin/bash
 # update-claude-desktop.sh
-# Patches the Claude desktop app to use the npm (Node.js) version of claude-code
+# Patches Claude Code binaries to use the npm (Node.js) version of claude-code
 # instead of the native Bun binary, which crashes on older Intel CPUs (pre-AVX2).
 #
 # Usage: ./update-claude-desktop.sh
+#
+# Safe to re-run anytime — it patches every version directory it finds under
+# the desktop app's claude-code folder (the app creates a NEW version dir on
+# each update rather than overwriting the old one in place), skips binaries
+# that are already patched, and locks each patched binary with chflags uchg
+# so the app's own launch-time integrity check can't silently revert it.
+# It also maintains the `claude` CLI wrapper in nvm's bin dir the same way.
 
 set -e
 
@@ -20,32 +27,25 @@ if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
 fi
 
 NODE_PATH="$(which node)"
+NVM_BIN_DIR="$(dirname "$NODE_PATH")"
+CLI_WRAPPER="$NVM_BIN_DIR/claude"
 echo "Using node: $NODE_PATH ($(node -v))"
 
-# Find the latest version directory in claude-code
-if [ ! -d "$CLAUDE_CODE_DIR" ]; then
-    echo "Error: Claude code directory not found at $CLAUDE_CODE_DIR"
-    echo "Make sure the Claude desktop app is installed."
-    exit 1
-fi
+# ---------------------------------------------------------------------------
+# Install the pinned npm package. Later versions dropped the bundled cli.js
+# in favor of a platform-specific native binary (same AVX2 requirement this
+# script exists to work around), so "@latest" silently breaks this fix.
+#
+# Unlock the CLI wrapper first if it's locked (chflags uchg) — npm refuses to
+# overwrite a non-symlink file at a package's bin path, and needs to manage
+# this path during install.
+# ---------------------------------------------------------------------------
+chflags nouchg "$CLI_WRAPPER" 2>/dev/null || true
+rm -f "$CLI_WRAPPER"
 
-LATEST_VERSION=$(ls -1 "$CLAUDE_CODE_DIR" | sort -V | tail -1)
-if [ -z "$LATEST_VERSION" ]; then
-    echo "Error: No version directory found in $CLAUDE_CODE_DIR"
-    exit 1
-fi
-
-APP_BINARY_PATH="$CLAUDE_CODE_DIR/$LATEST_VERSION/claude.app/Contents/MacOS/claude"
-STANDALONE_BINARY_PATH="$CLAUDE_CODE_DIR/$LATEST_VERSION/claude"
-echo "Found desktop claude-code version: $LATEST_VERSION"
-
-# Pin to 2.1.112 — later versions dropped the bundled cli.js in favor of a
-# platform-specific native binary (same AVX2 requirement this script exists
-# to work around), so "@latest" silently breaks this fix.
 echo "Installing @anthropic-ai/claude-code@2.1.112..."
 npm install -g @anthropic-ai/claude-code@2.1.112
 
-# Find the installed cli.js
 CLI_JS="$(npm root -g)/@anthropic-ai/claude-code/cli.js"
 if [ ! -f "$CLI_JS" ]; then
     echo "Error: cli.js not found at $CLI_JS"
@@ -55,35 +55,74 @@ fi
 NPM_VERSION=$(node -e "console.log(require('$(npm root -g)/@anthropic-ai/claude-code/package.json').version)")
 echo "npm claude-code version: $NPM_VERSION"
 
-# Patch both the app bundle binary (used by desktop app) and the standalone binary
-for BINARY_PATH in "$APP_BINARY_PATH" "$STANDALONE_BINARY_PATH"; do
-    if [ ! -e "$BINARY_PATH" ] && [ ! -L "$BINARY_PATH" ]; then
-        echo "Skipping $BINARY_PATH (not found)"
-        continue
-    fi
-
-    if file "$BINARY_PATH" 2>/dev/null | grep -q "Mach-O"; then
-        echo "Backing up native binary: $BINARY_PATH -> ${BINARY_PATH}.bun.bak"
-        mv "$BINARY_PATH" "${BINARY_PATH}.bun.bak"
-    elif head -1 "$BINARY_PATH" 2>/dev/null | grep -q "^#!/bin/bash"; then
-        echo "Existing wrapper found, replacing: $BINARY_PATH"
-    fi
-
-    cat > "$BINARY_PATH" << EOF
+# ---------------------------------------------------------------------------
+# Recreate and lock the CLI wrapper. npm's install just replaced it with its
+# own symlink to cli.js — overwrite that with our wrapper and lock it so
+# nothing (npm, the desktop app's auto-updater, etc.) can silently revert it.
+# ---------------------------------------------------------------------------
+cat > "$CLI_WRAPPER" << EOF
 #!/bin/bash
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
 exec node "$CLI_JS" "\$@"
 EOF
-    chmod +x "$BINARY_PATH"
-    echo "Patched: $BINARY_PATH"
+chmod +x "$CLI_WRAPPER"
+chflags uchg "$CLI_WRAPPER"
+echo "Patched + locked CLI: $CLI_WRAPPER"
+
+# ---------------------------------------------------------------------------
+# Patch every version directory found under the desktop app's claude-code
+# folder. The app creates a new version dir on each update rather than
+# overwriting the old one, so old and new can coexist — patch all of them.
+# ---------------------------------------------------------------------------
+if [ ! -d "$CLAUDE_CODE_DIR" ]; then
+    echo ""
+    echo "No desktop app directory found at $CLAUDE_CODE_DIR — nothing more to patch."
+    echo "(This is normal if you only use the CLI, not the desktop app.)"
+    exit 0
+fi
+
+PATCHED_ANY=false
+for VERSION_DIR in "$CLAUDE_CODE_DIR"/*/; do
+    [ -d "$VERSION_DIR" ] || continue
+    VERSION_DIR="${VERSION_DIR%/}"
+    VERSION_NAME="$(basename "$VERSION_DIR")"
+    APP_BINARY_PATH="$VERSION_DIR/claude.app/Contents/MacOS/claude"
+    STANDALONE_BINARY_PATH="$VERSION_DIR/claude"
+
+    for BINARY_PATH in "$APP_BINARY_PATH" "$STANDALONE_BINARY_PATH"; do
+        if [ ! -e "$BINARY_PATH" ] && [ ! -L "$BINARY_PATH" ]; then
+            continue
+        fi
+
+        # Already patched (and presumably locked)? Skip — keeps re-runs cheap
+        # and idempotent so this is safe to call from a watcher/cron job.
+        if head -1 "$BINARY_PATH" 2>/dev/null | grep -q "^#!/bin/bash"; then
+            continue
+        fi
+
+        if file "$BINARY_PATH" 2>/dev/null | grep -q "Mach-O"; then
+            chflags nouchg "$BINARY_PATH" 2>/dev/null || true
+            echo "Backing up native binary: $BINARY_PATH -> ${BINARY_PATH}.bun.bak"
+            mv "$BINARY_PATH" "${BINARY_PATH}.bun.bak"
+        fi
+
+        cat > "$BINARY_PATH" << EOF
+#!/bin/bash
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+exec node "$CLI_JS" "\$@"
+EOF
+        chmod +x "$BINARY_PATH"
+        chflags uchg "$BINARY_PATH"
+        echo "Patched + locked: $BINARY_PATH (version $VERSION_NAME)"
+        PATCHED_ANY=true
+    done
 done
 
 echo ""
-echo "Done! Claude desktop app patched."
-echo "  Desktop version dir: $LATEST_VERSION"
-echo "  npm claude-code:     $NPM_VERSION"
-echo "  App binary:          $APP_BINARY_PATH"
-echo "  Standalone binary:   $STANDALONE_BINARY_PATH"
-echo ""
-echo "Restart the Claude desktop app to apply."
+if [ "$PATCHED_ANY" = true ]; then
+    echo "Done! Restart the Claude desktop app to apply."
+else
+    echo "Done! Every version directory was already patched — nothing to do."
+fi
